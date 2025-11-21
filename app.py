@@ -8,8 +8,8 @@ import zipfile
 import shutil
 import logging
 import traceback
+import gc # Importamos el recolector de basura
 
-# Configuración de logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('dicom_api')
 
@@ -18,26 +18,22 @@ CORS(app)
 
 @app.route('/', methods=['GET'])
 def home():
-    return "Servidor DICOM (Low Memory Mode) Activo.", 200
+    return "Servidor DICOM Ultra-Lite Activo.", 200
 
 @app.route('/convert', methods=['POST'])
 def convert():
-    logger.info("--> Recibida petición de conversión")
+    logger.info("--> Recibida petición")
     
     files = request.files.getlist('file')
-    
-    if not files or len(files) == 0:
-        return "No files provided", 400
-        
-    logger.info(f"Recibidos {len(files)} archivos.")
+    if not files: return "No files", 400
     
     temp_dir = tempfile.mkdtemp()
     output_path = os.path.join(temp_dir, "holograma.glb")
-    clean_path = os.path.join(temp_dir, "clean_volume.mha")
+    clean_path = os.path.join(temp_dir, "clean.mha")
 
     try:
         # 1. Guardar archivos
-        saved_files_count = 0
+        saved_count = 0
         is_zip = False
         zip_path = ""
 
@@ -45,95 +41,83 @@ def convert():
             filename = file.filename
             save_path = os.path.join(temp_dir, filename)
             file.save(save_path)
-            saved_files_count += 1
+            saved_count += 1
             if filename.lower().endswith('.zip'):
                 is_zip = True
                 zip_path = save_path
 
-        # 2. Leer Imagen (SimpleITK)
+        # 2. Leer Imagen
         dicom_dir = temp_dir
-        if is_zip and saved_files_count == 1:
+        if is_zip and saved_count == 1:
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
         
         reader = sitk.ImageSeriesReader()
         series_ids = reader.GetGDCMSeriesIDs(dicom_dir)
-
         if not series_ids:
-            for root, dirs, fs in os.walk(dicom_dir):
+             # Búsqueda profunda
+             for root, dirs, fs in os.walk(dicom_dir):
                 series_ids = reader.GetGDCMSeriesIDs(root)
                 if series_ids:
                     dicom_dir = root
                     break
-        
-        image = None
+
         if not series_ids:
-            # Modo archivo único
+            # Fallback a archivo único
             dcm_files = [f for f in os.listdir(temp_dir) if f.endswith('.dcm')]
             if dcm_files:
                 image = sitk.ReadImage(os.path.join(temp_dir, dcm_files[0]))
             else:
-                raise Exception("No DICOM found")
+                raise Exception("No se encontraron imagenes validas")
         else:
-            logger.info(f"Serie encontrada: {series_ids[0]}")
+            logger.info("Leyendo serie DICOM...")
             dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir, series_ids[0])
             reader.SetFileNames(dicom_names)
             image = reader.Execute()
 
-        # --- OPTIMIZACIÓN CRÍTICA DE MEMORIA (DOWNSAMPLING) ---
-        original_size = image.GetSize()
-        logger.info(f"Tamaño original: {original_size}")
+        # 3. OPTIMIZACIÓN AGRESIVA (Factor 3)
+        # Esto reduce el peso volumétrico 27 veces.
+        logger.info("Aplicando reducción agresiva (Factor 3)...")
+        image = sitk.Shrink(image, [3, 3, 3])
+        logger.info(f"Tamaño final: {image.GetSize()}")
 
-        # Si el volumen es grande (más de 100 pixeles), lo reducimos a la mitad
-        # Esto reduce el uso de RAM en un factor de 8x.
-        if original_size[0] > 150:
-            logger.info("Aplicando reducción (Shrink) para ahorrar memoria...")
-            image = sitk.Shrink(image, [2, 2, 2]) # Reduce a la mitad en X, Y, Z
-            logger.info(f"Nuevo tamaño optimizado: {image.GetSize()}")
-
-        # 3. Procesamiento VTK
         sitk.WriteImage(image, clean_path)
         
-        # Liberamos memoria de SimpleITK
-        image = None 
+        # --- LIMPIEZA DE MEMORIA CRÍTICA ---
+        image = None # Borrar objeto imagen
+        reader = None # Borrar lector
+        gc.collect() # Forzar limpieza de RAM
+        logger.info("Memoria limpiada. Iniciando VTK...")
 
+        # 4. Generación 3D
         vtk_reader = vtk.vtkMetaImageReader()
         vtk_reader.SetFileName(clean_path)
         vtk_reader.Update()
-
-        size = vtk_reader.GetOutput().GetDimensions()
-        final_polydata = None
-
-        if len(size) > 2 and size[2] > 1:
-            # 3D Volume
-            logger.info("Generando Isosuperficie (Low-Poly)...")
+        
+        # Usamos FlyingEdges3D si es posible (es más rápido y gasta menos RAM que MarchingCubes)
+        # Si falla, usa MarchingCubes
+        try:
+            surface = vtk.vtkFlyingEdges3D()
+        except:
             surface = vtk.vtkMarchingCubes()
-            surface.SetInputConnection(vtk_reader.GetOutputPort())
-            surface.ComputeNormalsOn()
             
-            # Umbral 200 (Hueso más denso) genera menos geometría que 150
-            surface.SetValue(0, 200) 
-            
-            # Reducir polígonos drásticamente (80% reducción)
-            decimate = vtk.vtkQuadricDecimation()
-            decimate.SetInputConnection(surface.GetOutputPort())
-            decimate.SetTargetReduction(0.8) 
-            decimate.Update()
-            
-            final_polydata = decimate.GetOutput()
-        else:
-            # 2D Image
-            surface = vtk.vtkImageDataGeometryFilter()
-            surface.SetInputConnection(vtk_reader.GetOutputPort())
-            surface.Update()
-            final_polydata = surface.GetOutput()
+        surface.SetInputConnection(vtk_reader.GetOutputPort())
+        surface.ComputeNormalsOn()
+        surface.SetValue(0, 200) # Umbral Hueso
+        
+        # Decimación (Simplificación de malla)
+        decimate = vtk.vtkQuadricDecimation()
+        decimate.SetInputConnection(surface.GetOutputPort())
+        decimate.SetTargetReduction(0.7) # Quitar 70% de triángulos
+        decimate.Update()
 
-        # Empaquetar para GLB
+        # Empaquetar
+        final_polydata = decimate.GetOutput()
         mb = vtk.vtkMultiBlockDataSet()
         mb.SetNumberOfBlocks(1)
         mb.SetBlock(0, final_polydata)
         
-        logger.info("Guardando GLB...")
+        logger.info("Escribiendo GLB...")
         writer = vtk.vtkGLTFWriter()
         writer.SetInputData(mb)
         writer.SetFileName(output_path)
@@ -147,8 +131,8 @@ def convert():
         return f"Error: {str(e)}", 500
         
     finally:
-        # Limpieza agresiva
         shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
