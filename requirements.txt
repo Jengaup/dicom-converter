@@ -1,3 +1,5 @@
 flask
 vtk
 gunicorn
+flask-cors
+SimpleITK
