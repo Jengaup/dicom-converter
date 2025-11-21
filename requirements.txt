@@ -1,5 +1,8 @@
 flask
-vtk
 gunicorn
 flask-cors
 SimpleITK
+scikit-image
+trimesh
+numpy
+scipy
