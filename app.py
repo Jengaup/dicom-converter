@@ -8,7 +8,6 @@ import zipfile
 import shutil
 import logging
 
-# Configuración de logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('dicom_api')
 
@@ -17,106 +16,117 @@ CORS(app)
 
 @app.route('/', methods=['GET'])
 def home():
-    return "Servidor DICOM (Soporte ZIP) Activo.", 200
-
-def find_dicom_series(directory):
-    """Busca series DICOM dentro de una carpeta (y subcarpetas)"""
-    reader = sitk.ImageSeriesReader()
-    series_ids = reader.GetGDCMSeriesIDs(directory)
-    
-    # Si no encuentra en la raíz, busca en subcarpetas
-    if not series_ids:
-        for root, dirs, files in os.walk(directory):
-            series_ids = reader.GetGDCMSeriesIDs(root)
-            if series_ids:
-                return root, series_ids
-        return None, None
-    return directory, series_ids
+    return "Servidor DICOM Multi-archivo Activo.", 200
 
 @app.route('/convert', methods=['POST'])
 def convert():
-    logger.info("--> Recibida petición (ZIP o archivo único)")
+    logger.info("--> Recibida petición de conversión")
     
-    if 'file' not in request.files:
-        return "No file provided", 400
+    # 1. Obtener la lista de archivos (getlist toma TODOS los archivos enviados)
+    files = request.files.getlist('file')
     
-    file = request.files['file']
-    temp_dir = tempfile.mkdtemp() # Carpeta temporal para descomprimir
-    input_path = os.path.join(temp_dir, file.filename)
+    if not files or len(files) == 0:
+        return "No files provided", 400
+        
+    logger.info(f"Recibidos {len(files)} archivos.")
+    
+    temp_dir = tempfile.mkdtemp()
     output_path = os.path.join(temp_dir, "holograma.glb")
     clean_path = os.path.join(temp_dir, "clean_volume.mha")
 
     try:
-        file.save(input_path)
-        
-        image = None
+        # 2. Guardar TODOS los archivos en la carpeta temporal
+        saved_files_count = 0
+        is_zip = False
+        zip_path = ""
 
-        # CASO A: Es un ZIP (Lo que tú vas a usar)
-        if file.filename.lower().endswith('.zip'):
-            logger.info("Detectado archivo ZIP. Descomprimiendo...")
-            with zipfile.ZipFile(input_path, 'r') as zip_ref:
+        for file in files:
+            filename = file.filename
+            save_path = os.path.join(temp_dir, filename)
+            file.save(save_path)
+            saved_files_count += 1
+            
+            if filename.lower().endswith('.zip'):
+                is_zip = True
+                zip_path = save_path
+
+        logger.info(f"Guardados {saved_files_count} archivos en disco.")
+
+        # 3. Estrategia de Lectura
+        dicom_dir = temp_dir
+
+        # Si envió un ZIP, descomprimir
+        if is_zip and saved_files_count == 1:
+            logger.info("Descomprimiendo ZIP...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
-            
-            # Buscar dónde están las imágenes DICOM dentro del zip
-            dicom_dir, series_ids = find_dicom_series(temp_dir)
-            
-            if not series_ids:
-                return "El ZIP no contiene series DICOM válidas", 400
-                
-            logger.info(f"Encontrada serie ID: {series_ids[0]}")
-            
-            # Leer la serie completa (el volumen 3D)
-            reader = sitk.ImageSeriesReader()
+        
+        # Buscar series DICOM en la carpeta
+        reader = sitk.ImageSeriesReader()
+        series_ids = reader.GetGDCMSeriesIDs(dicom_dir)
+
+        if not series_ids:
+            # Intentar búsqueda profunda por si acaso
+            logger.info("No se detectó serie en raíz, buscando en subcarpetas...")
+            for root, dirs, fs in os.walk(dicom_dir):
+                series_ids = reader.GetGDCMSeriesIDs(root)
+                if series_ids:
+                    dicom_dir = root
+                    break
+        
+        if not series_ids:
+            # Último intento: ¿Es una imagen suelta?
+            logger.warning("No se detectó serie. Intentando leer como archivo único...")
+            # Tomamos el primer archivo que parezca imagen
+            first_file = [f for f in os.listdir(temp_dir) if f.endswith('.dcm')][0]
+            image = sitk.ReadImage(os.path.join(temp_dir, first_file))
+        else:
+            logger.info(f"Serie encontrada: {series_ids[0]}")
             dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir, series_ids[0])
             reader.SetFileNames(dicom_names)
             image = reader.Execute()
 
-        # CASO B: Es un archivo suelto
-        else:
-            logger.info("Detectado archivo único.")
-            image = sitk.ReadImage(input_path)
-
-        # --- PROCESAMIENTO 3D (Igual que antes) ---
-        
-        # Convertir a formato intermedio limpio
+        # 4. Procesamiento 3D (Igual que siempre)
         sitk.WriteImage(image, clean_path)
         
-        # Leer con VTK
         vtk_reader = vtk.vtkMetaImageReader()
         vtk_reader.SetFileName(clean_path)
         vtk_reader.Update()
 
-        # Extraer superficie (Huesos/Tejido)
-        logger.info("Generando malla 3D...")
-        surface = vtk.vtkMarchingCubes()
-        surface.SetInputConnection(vtk_reader.GetOutputPort())
-        surface.ComputeNormalsOn()
-        
-        # VALOR CLAVE: 150-300 suele ser hueso. 
-        # Si sale vacío, puede que necesitemos ajustar esto dinámicamente,
-        # pero probemos con 150.
-        surface.SetValue(0, 150) 
+        size = image.GetSize()
+        logger.info(f"Tamaño del volumen: {size}")
 
-        # Reducir número de triángulos para que cargue rápido en web (Decimate)
-        decimate = vtk.vtkQuadricDecimation()
-        decimate.SetInputConnection(surface.GetOutputPort())
-        decimate.SetTargetReduction(0.5) # Reduce el peso al 50%
-        
-        # Guardar GLB
+        # Generar Geometría
+        if len(size) > 2 and size[2] > 1:
+            # VOLUMEN 3D
+            surface = vtk.vtkMarchingCubes()
+            surface.SetInputConnection(vtk_reader.GetOutputPort())
+            surface.ComputeNormalsOn()
+            surface.SetValue(0, 150) # Umbral hueso
+            
+            decimate = vtk.vtkQuadricDecimation()
+            decimate.SetInputConnection(surface.GetOutputPort())
+            decimate.SetTargetReduction(0.5) # Optimizar
+            final_port = decimate.GetOutputPort()
+        else:
+            # IMAGEN PLANA
+            surface = vtk.vtkImageDataGeometryFilter()
+            surface.SetInputConnection(vtk_reader.GetOutputPort())
+            final_port = surface.GetOutputPort()
+
+        # Guardar
         writer = vtk.vtkGLTFWriter()
-        writer.SetInputConnection(decimate.GetOutputPort())
+        writer.SetInputConnection(final_port)
         writer.SetFileName(output_path)
         writer.Write()
         
-        logger.info("¡Holograma ZIP generado!")
-        return send_file(output_path, as_attachment=True, download_name='holograma_xreal.glb')
+        return send_file(output_path, as_attachment=True, download_name='holograma.glb')
 
     except Exception as e:
-        logger.error(f"ERROR CRITICO: {str(e)}")
-        return f"Error procesando ZIP: {str(e)}", 500
+        logger.error(f"ERROR: {str(e)}")
+        return f"Error procesando archivos: {str(e)}", 500
         
     finally:
-        # Borrar carpeta temporal completa
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
