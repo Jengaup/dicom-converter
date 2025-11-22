@@ -11,6 +11,7 @@ import numpy as np
 from skimage.measure import marching_cubes
 import trimesh
 
+# Configuración básica
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('dicom_api')
 
@@ -19,114 +20,111 @@ CORS(app)
 
 @app.route('/', methods=['GET'])
 def home():
-    return "Servidor Ligero (No-VTK) Activo.", 200
+    return "Motor Holográfico Ligero (ZIP Support) Activo.", 200
 
 @app.route('/convert', methods=['POST'])
 def convert():
-    logger.info("--> Recibida petición (Motor Ligero)")
+    logger.info("--> Iniciando proceso")
     
+    # 1. Recibir el archivo (esperamos un ZIP o lista)
     files = request.files.getlist('file')
-    if not files: return "No files", 400
+    if not files: return "No se recibieron archivos", 400
     
     temp_dir = tempfile.mkdtemp()
     output_path = os.path.join(temp_dir, "holograma.glb")
 
     try:
-        # 1. Guardar archivos
-        saved_count = 0
-        is_zip = False
+        # 2. Guardar en disco
         zip_path = ""
-
+        is_zip = False
+        
         for file in files:
-            filename = file.filename
-            save_path = os.path.join(temp_dir, filename)
+            save_path = os.path.join(temp_dir, file.filename)
             file.save(save_path)
-            saved_count += 1
-            if filename.lower().endswith('.zip'):
+            if file.filename.lower().endswith('.zip'):
                 is_zip = True
                 zip_path = save_path
 
-        # 2. Leer Imagen con SimpleITK
+        # 3. Descomprimir si es ZIP (Estrategia Base44)
         dicom_dir = temp_dir
-        if is_zip and saved_count == 1:
+        if is_zip:
+            logger.info("Descomprimiendo ZIP recibido...")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
-        
+                # Borrar el zip original para liberar espacio
+                os.remove(zip_path) 
+
+        # 4. Leer Serie DICOM
         reader = sitk.ImageSeriesReader()
+        # Buscar IDs de series
         series_ids = reader.GetGDCMSeriesIDs(dicom_dir)
         
-        # Búsqueda recursiva si falla la primera
+        # Si no encuentra en raiz, busca en subcarpetas
         if not series_ids:
              for root, dirs, fs in os.walk(dicom_dir):
                 series_ids = reader.GetGDCMSeriesIDs(root)
                 if series_ids:
                     dicom_dir = root
                     break
-
+        
         image = None
         if series_ids:
-            logger.info("Leyendo serie DICOM...")
+            logger.info(f"Serie encontrada. Cargando {len(series_ids)} serie(s)...")
             dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir, series_ids[0])
             reader.SetFileNames(dicom_names)
             image = reader.Execute()
         else:
-            # Modo archivo único
+            # Intento de carga de archivo único
             dcm_files = [f for f in os.listdir(temp_dir) if f.endswith('.dcm')]
             if dcm_files:
                 image = sitk.ReadImage(os.path.join(temp_dir, dcm_files[0]))
             else:
-                raise Exception("No se encontraron imagenes DICOM")
+                return "No se encontraron imágenes DICOM válidas en el archivo enviado.", 400
 
-        # 3. OPTIMIZACIÓN (Shrink)
-        # Usamos factor 2 (menos agresivo que antes, porque este motor es más eficiente)
-        # Si falla, sube esto a 3.
-        logger.info(f"Tamaño original: {image.GetSize()}")
-        if image.GetSize()[0] > 128:
-            logger.info("Reduciendo imagen (Factor 2)...")
+        # 5. REDUCCIÓN INTELIGENTE (Para no explotar memoria)
+        size = image.GetSize()
+        logger.info(f"Tamaño original: {size}")
+        
+        # Si es grande, encogemos x2 (8 veces menos RAM)
+        if size[0] > 150:
+            logger.info("Aplicando optimización de memoria (Factor 2)...")
             image = sitk.Shrink(image, [2, 2, 2])
         
-        # 4. CONVERSIÓN A NUMPY (Matemáticas puras)
-        # Convertimos la imagen médica a una matriz de números
+        # 6. GENERACIÓN DE MALLA (Algoritmo Ligero)
+        # Convertir a Numpy
         volume_np = sitk.GetArrayFromImage(image)
         
-        # Limpiamos memoria de SimpleITK inmediatamente
+        # Limpieza inmediata de memoria
         image = None
         reader = None
         gc.collect()
-        
-        logger.info(f"Generando malla con scikit-image... Shape: {volume_np.shape}")
 
-        # 5. MARCHING CUBES (Sin VTK)
-        # level=200 es el umbral del hueso
+        logger.info("Generando triángulos...")
+        # Umbral 150-200 suele ser hueso/contraste
         try:
-            verts, faces, normals, values = marching_cubes(volume_np, level=200)
-        except RuntimeError as e:
-            # Si falla por umbral, intentamos uno más bajo (tejido)
-            logger.warning("Umbral 200 falló, intentando 100...")
-            verts, faces, normals, values = marching_cubes(volume_np, level=100)
+            verts, faces, normals, values = marching_cubes(volume_np, level=150)
+        except:
+            # Fallback por si el umbral es muy alto
+            verts, faces, normals, values = marching_cubes(volume_np, level=50)
 
-        logger.info(f"Malla generada: {len(verts)} vértices.")
-
-        # 6. EXPORTAR CON TRIMESH
-        # Trimesh es muy ligero para guardar GLB
+        # 7. EXPORTAR A GLB
+        logger.info(f"Exportando {len(verts)} vértices a GLB...")
         mesh = trimesh.Trimesh(vertices=verts, faces=faces)
         
-        # Opcional: Suavizar un poco (Laplacian smoothing) para que se vea mejor
-        try:
-            trimesh.smoothing.filter_laplacian(mesh, iterations=1)
-        except:
-            pass
-
-        mesh.export(output_path)
-        logger.info("GLB guardado correctamente.")
+        # Pequeño suavizado para que se vea mejor en las gafas
+        trimesh.smoothing.filter_laplacian(mesh, iterations=2)
         
+        mesh.export(output_path)
+        
+        logger.info("¡Éxito! Enviando archivo.")
         return send_file(output_path, as_attachment=True, download_name='holograma.glb')
 
     except Exception as e:
         logger.error(f"ERROR: {str(e)}")
-        return f"Error: {str(e)}", 500
+        return f"Error del servidor: {str(e)}", 500
         
     finally:
+        # Limpieza final
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
 
